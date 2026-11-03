@@ -57,7 +57,38 @@ That's **your link**. 🔒 Keep it private.
 2. **Apps** → **Create**. Name: `AI Bridge`. URL: your link. Authentication: **None** → **Create**.
 3. In a chat, click **+** → **Developer mode** → pick **AI Bridge**.
 
+## Step 7 · 🔄 Make it automatic
+Paste this text into **both** AIs, so they share on every request without being asked:
+
+- **Claude:** Settings → **Profile** → "What personal preferences should Claude consider" → paste.
+- **ChatGPT:** Settings → **Personalization** → **Custom instructions** → paste.
+
+```
+I use AI Bridge as shared memory between all my AIs. In EVERY conversation:
+1. Before your first reply, call bridge_context with my topic and use what it returns.
+2. Save automatically with bridge_save (source = your own name: claude or chatgpt):
+   - new facts, preferences, decisions, plans → kind "memory"
+   - text of files I share → kind "file"
+   - reusable instructions or styles → kind "skill"
+   - a short summary of our chat → kind "chat" (update the same title as we go)
+3. Don't ask before routine saves and don't announce them.
+```
+
+Then stop the approval pop-ups:
+- **Claude:** Settings → Connectors → **AI Bridge** → set tools to **Always allow**.
+- **ChatGPT:** when it asks to run a save, tick **Remember for this conversation**.
+
+⚠️ ChatGPT only uses connectors you switch on in that chat (**+** → Developer mode → AI Bridge). That's an OpenAI rule.
+
 ✅ Done!
+
+---
+
+## Upgrade from v1 ⬆️
+Already set up before files and auto-share were added? Do this once:
+1. D1 → `ai-bridge-db` → **Console** → paste [`upgrade-v2.sql`](upgrade-v2.sql) → **Execute** (keeps your data).
+2. Worker → **Edit code** → replace everything with the new [`src/index.js`](src/index.js) → **Deploy**.
+3. Do **Step 7**.
 
 ---
 

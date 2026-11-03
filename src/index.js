@@ -9,15 +9,23 @@
 //
 // Needs: a D1 binding named DB, and a secret named BRIDGE_SECRET (16+ characters).
 
-const SERVER_INFO = { name: "ai-bridge", version: "1.1.0" };
+const SERVER_INFO = { name: "ai-bridge", version: "2.0.0" };
 const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const KINDS = ["memory", "chat", "skill"];
+const KINDS = ["memory", "chat", "skill", "file"];
 const MAX_CONTENT = 200_000; // characters per item
+const CONTEXT_BUDGET = 24_000; // characters returned by bridge_context
 
-const INSTRUCTIONS = `AI Bridge is shared memory between the user's AI assistants (Claude, ChatGPT, ...).
-- When the user mentions something from another assistant, or a task needs past context, call bridge_search first.
-- Save durable facts, project context, chat summaries and skills with bridge_save, using YOUR OWN name as "source" ("claude" if you are Claude, "chatgpt" if you are ChatGPT).
-- Never overwrite or delete items saved by a different source.`;
+const INSTRUCTIONS = `AI Bridge is the user's shared memory across ALL their AI assistants (Claude, ChatGPT, ...). The user wants everything shared automatically, without being asked.
+
+ALWAYS, in every conversation:
+1. START: before your first answer, call bridge_context (pass the user's topic). Use what it returns as if you had remembered it yourself.
+2. DURING: whenever the user shares a new fact, preference, decision, project detail or plan, call bridge_save with kind "memory".
+3. FILES: when the user shares a file or document, save its text with kind "file" (title = file name).
+4. SKILLS: when you follow or create a reusable procedure, style guide or instructions, save it with kind "skill".
+5. END: after any substantial exchange, save or update a short summary of this conversation with kind "chat" (title = the conversation topic; reuse the same title to update it).
+6. When the user mentions another assistant or past work, call bridge_search.
+
+Always use YOUR OWN name as "source": "claude" if you are Claude, "chatgpt" if you are ChatGPT. Never overwrite or delete items saved by a different source. Do not announce routine saves; just do them.`;
 
 const SOURCE_PROP = {
   type: "string",
@@ -26,10 +34,22 @@ const SOURCE_PROP = {
 const KIND_PROP = {
   type: "string",
   enum: KINDS,
-  description: "memory = facts/preferences, chat = conversation or summary, skill = reusable instructions",
+  description: "memory = facts/preferences, chat = conversation summary, skill = reusable instructions, file = text of a shared file",
 };
 
 const TOOLS = [
+  {
+    name: "bridge_context",
+    title: "Load shared context",
+    description: "CALL THIS FIRST in every conversation, before answering. Returns everything shared by all the user's AIs: memories, skills, recent chat summaries, files, plus items matching the topic.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "Main words of the user's request, to also pull matching items" },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
   {
     name: "bridge_search",
     title: "Search shared memory",
@@ -37,7 +57,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Words to look for (all words must match)" },
+        query: { type: "string", description: "Words to look for" },
+        match: { type: "string", enum: ["all", "any"], default: "all", description: "all = every word must match, any = at least one" },
         source: { ...SOURCE_PROP, description: "Only items from this AI. Omit to search all." },
         kind: KIND_PROP,
         limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
@@ -78,7 +99,7 @@ const TOOLS = [
   {
     name: "bridge_save",
     title: "Save to shared memory",
-    description: "Save or update a memory, chat summary or skill under YOUR OWN source name. Same source+kind+title updates the existing item.",
+    description: "Save or update a memory, chat summary, skill or file under YOUR OWN source name. Call it automatically whenever there is something new worth sharing. Same source+kind+title updates the existing item.",
     inputSchema: {
       type: "object",
       properties: {
@@ -162,18 +183,65 @@ const UPSERT_SQL = `INSERT INTO items (source, kind, title, content, tags)
 
 // ---------- tools ----------
 
+async function buildContext(db, topic) {
+  const out = [];
+  let used = 0;
+  const add = (line) => {
+    if (used + line.length > CONTEXT_BUDGET) return false;
+    out.push(line);
+    used += line.length + 1;
+    return true;
+  };
+  const section = async (heading, sql, fmt) => {
+    const { results } = await db.prepare(sql).all();
+    if (!results.length) return;
+    if (!add(`\n## ${heading}`)) return;
+    for (const r of results) if (!add(fmt(r))) { add("…(more — use bridge_list / bridge_search)"); break; }
+  };
+  const short = (s, n) => (s.length > n ? s.slice(0, n).replace(/\s+\S*$/, "") + "…" : s).replace(/\s+/g, " ");
+
+  add("# AI Bridge — shared context from all the user's AIs");
+
+  if (topic && String(topic).trim()) {
+    const words = String(topic).toLowerCase().split(/\s+/).filter((w) => w.length > 2).slice(0, 8).join(" ");
+    const hits = words ? await callTool({ DB: db }, "bridge_search", { query: words, match: "any", limit: 8 }) : "No matching";
+    if (!hits.startsWith("No matching")) add(`\n## Matching "${short(String(topic), 60)}"\n${hits}`);
+  }
+  await section("Memories",
+    "SELECT id, source, title, content FROM items WHERE kind='memory' ORDER BY updated_at DESC LIMIT 150",
+    (r) => `- [${r.source}] ${short(r.content, 400)} (#${r.id})`);
+  await section("Skills",
+    "SELECT id, source, title, content FROM items WHERE kind='skill' ORDER BY updated_at DESC LIMIT 40",
+    (r) => `- #${r.id} [${r.source}] ${r.title}: ${short(r.content, 160)}`);
+  await section("Recent chats",
+    "SELECT id, source, title, content, updated_at FROM items WHERE kind='chat' ORDER BY updated_at DESC LIMIT 15",
+    (r) => `- #${r.id} [${r.source}] ${r.title} (${r.updated_at.slice(0, 10)}): ${short(r.content, 220)}`);
+  await section("Files",
+    "SELECT id, source, title, length(content) AS size FROM items WHERE kind='file' ORDER BY updated_at DESC LIMIT 30",
+    (r) => `- #${r.id} [${r.source}] ${r.title} (${r.size} chars)`);
+
+  if (out.length === 1) return "AI Bridge is empty so far. Save new facts, files, skills and a chat summary with bridge_save as you go.";
+  add("\nUse bridge_read with an id for full content. Keep saving new facts, files, skills and a chat summary with bridge_save.");
+  return out.join("\n");
+}
+
 async function callTool(env, name, args = {}) {
   const db = env.DB;
   switch (name) {
+    case "bridge_context":
+      return buildContext(db, args.topic);
+
     case "bridge_search": {
       const words = String(args.query || "").toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
       if (!words.length) throw new Error("query is required");
       const where = [];
       const params = [];
+      const wordMatch = [];
       for (const w of words) {
         params.push(`%${w.replace(/[\\%_]/g, (c) => "\\" + c)}%`);
-        where.push(`lower(title || ' ' || tags || ' ' || content) LIKE ?${params.length} ESCAPE '\\'`);
+        wordMatch.push(`lower(title || ' ' || tags || ' ' || content) LIKE ?${params.length} ESCAPE '\\'`);
       }
+      where.push(`(${wordMatch.join(args.match === "any" ? " OR " : " AND ")})`);
       if (args.source) { params.push(norm(args.source)); where.push(`source = ?${params.length}`); }
       if (args.kind) { params.push(norm(args.kind)); where.push(`kind = ?${params.length}`); }
       params.push(clampInt(args.limit, 10, 1, 50));
@@ -336,6 +404,9 @@ button:disabled{opacity:.5;cursor:default}#log{white-space:pre-wrap;font:13px/1.
 <section><h2>3. Skills</h2><small>SKILL.md or other .md instruction files.</small>
 <div class="row"><select id="skillSrc"><option value="claude">From Claude</option><option value="chatgpt">From ChatGPT</option><option value="other">Other AI</option></select></div>
 <input type="file" id="skills" accept=".md,.txt" multiple></section>
+<section><h2>4. Files</h2><small>Text files to share (.txt, .md, .csv, .json, .html). Each file's text is saved.</small>
+<div class="row"><select id="fileSrc"><option value="claude">From Claude</option><option value="chatgpt">From ChatGPT</option><option value="other">Other AI</option></select></div>
+<input type="file" id="files" accept=".txt,.md,.csv,.json,.html,.htm,.xml,.yaml,.yml" multiple></section>
 <button id="go">Upload to bridge</button><div id="log"></div>
 </main><script>
 const MAX=200000, log=(t)=>{document.getElementById('log').textContent+=t+"\\n"};
@@ -360,6 +431,8 @@ async function collect(){const items=[];
  if(mc)log('• memory: '+mc+' lines');
  const ss=document.getElementById('skillSrc').value;
  for(const f of document.getElementById('skills').files){items.push({source:ss,kind:'skill',title:f.name.replace(/\\.(md|txt)$/i,''),content:(await f.text()).slice(0,MAX),tags:'import'})}
+ const fs=document.getElementById('fileSrc').value;
+ for(const f of document.getElementById('files').files){items.push({source:fs,kind:'file',title:f.name,content:(await f.text()).slice(0,MAX),tags:'import'})}
  return items}
 document.getElementById('go').onclick=async(e)=>{const b=e.target;b.disabled=true;document.getElementById('log').textContent='';
  try{const items=await collect();if(!items.length){log('Nothing to upload.');return}let saved=0;
